@@ -1,0 +1,16 @@
+LICENSE
+README.md
+setup.py
+src/diffwave/__init__.py
+src/diffwave/__main__.py
+src/diffwave/dataset.py
+src/diffwave/inference.py
+src/diffwave/learner.py
+src/diffwave/model.py
+src/diffwave/params.py
+src/diffwave/preprocess.py
+src/diffwave.egg-info/PKG-INFO
+src/diffwave.egg-info/SOURCES.txt
+src/diffwave.egg-info/dependency_links.txt
+src/diffwave.egg-info/requires.txt
+src/diffwave.egg-info/top_level.txt

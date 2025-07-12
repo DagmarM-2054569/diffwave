@@ -1,0 +1,4 @@
+numpy
+torch>=1.6
+torchaudio>=0.9.0
+tqdm
