@@ -78,6 +78,7 @@ def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('
     noise_scale = torch.from_numpy(alpha_cum**0.5).float().unsqueeze(1).to(device)
 
     for n in range(len(alpha) - 1, -1, -1):
+      print(f'noise level: {n}')
       c1 = 1 / alpha[n]**0.5
       c2 = beta[n] / (1 - alpha_cum[n])**0.5
       audio = c1 * (audio - c2 * model(audio, torch.tensor([T[n]], device=audio.device), spectrogram).squeeze(1))
