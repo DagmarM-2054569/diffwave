@@ -26,14 +26,6 @@ from diffwave.model import DiffWave
 
 models = {}
 
-def _inflate_audio(audio, power_a):
-  if power_a is None or power_a == 1.0:
-    return audio
-  if power_a <= 0:
-    raise ValueError(f'inference_audio_power_a must be positive, got {power_a}.')
-  return torch.sign(audio) * torch.abs(audio).pow(1.0 / power_a)
-
-
 def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), fast_sampling=False):
   # Lazy load model.
   if not model_dir in models:
@@ -83,15 +75,13 @@ def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('
       audio = torch.randn(spectrogram.shape[0], model.params.hop_samples * spectrogram.shape[-1], device=device)
     else:
       audio = torch.randn(1, params.audio_len, device=device)
-    power_a = float(model.params.inference_audio_power_a)
+    noise_scale = torch.from_numpy(alpha_cum**0.5).float().unsqueeze(1).to(device)
 
     for n in range(len(alpha) - 1, -1, -1):
       print(f'noise level: {n}')
       c1 = 1 / alpha[n]**0.5
       c2 = beta[n] / (1 - alpha_cum[n])**0.5
-      step_audio = _inflate_audio(audio, power_a)
-      predicted_noise = model(step_audio, torch.tensor([T[n]], device=audio.device), spectrogram).squeeze(1)
-      audio = c1 * (step_audio - c2 * predicted_noise)
+      audio = c1 * (audio - c2 * model(audio, torch.tensor([T[n]], device=audio.device), spectrogram).squeeze(1))
       if n > 0:
         noise = torch.randn_like(audio)
         sigma = ((1.0 - alpha_cum[n-1]) / (1.0 - alpha_cum[n]) * beta[n])**0.5
@@ -105,9 +95,7 @@ def main(args):
     spectrogram = torch.from_numpy(np.load(args.spectrogram_path))
   else:
     spectrogram = None
-  inference_params = AttrDict(base_params)
-  inference_params.override({'inference_audio_power_a': args.inference_audio_power_a})
-  audio, sr = predict(spectrogram, model_dir=args.model_dir, fast_sampling=args.fast, params=inference_params)
+  audio, sr = predict(spectrogram, model_dir=args.model_dir, fast_sampling=args.fast, params=base_params)
   torchaudio.save(args.output, audio.cpu(), sample_rate=sr)
 
 
@@ -121,6 +109,4 @@ if __name__ == '__main__':
       help='output file name')
   parser.add_argument('--fast', '-f', action='store_true',
       help='fast sampling procedure')
-  parser.add_argument('--inference_audio_power_a', type=float, default=base_params.inference_audio_power_a,
-      help='sign-preserving power inflation factor applied before every denoising step (1.0 disables it)')
   main(parser.parse_args())
