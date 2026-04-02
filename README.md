@@ -89,9 +89,14 @@ audio, sample_rate = diffwave_predict(spectrogram, model_dir, fast_sampling=True
 # audio is a GPU tensor in [N,T] format.
 ```
 
+Inference uses `inference_audio_power_a=1.2` by default, which applies a
+sign-preserving `sign(x) * |x|^(1 / a)` transform before every denoising step.
+Set it to `1.0` to disable the effect, or try values around `1.1` to `1.5` to
+make quieter intermediate samples come through more strongly.
+
 ### Inference CLI
 ```
-python -m diffwave.inference --fast /path/to/model /path/to/spectrogram -o output.wav
+python -m diffwave.inference --fast /path/to/model /path/to/spectrogram -o output.wav --inference_audio_power_a 1.2
 ```
 
 ## References
