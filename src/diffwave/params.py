@@ -34,8 +34,8 @@ class AttrDict(dict):
 
 params = AttrDict(
     # Training params
-    batch_size=1,   #eigenverandering (2)
-    learning_rate=2e-4,
+    batch_size=15,   #eigenverandering (2)   29 causes memory crash
+    learning_rate=4e-5, #eigenverandering 2e-4 -> 2e-5
     max_grad_norm=None,
 
     # Data params
@@ -51,8 +51,7 @@ params = AttrDict(
     dilation_cycle_length=13, #eigenverandering 10->13
     unconditional = False,  #eigenverandering
     noise_schedule=np.linspace(1e-4, 0.05, 50).tolist(),
-    #inference_noise_schedule=[0.0001, 0.001, 0.01, 0.05, 0.2, 0.5],
-    inference_noise_schedule=np.linspace(1e-4, 0.0125, 200).tolist(),
+    inference_noise_schedule=[0.0001, 0.001, 0.01, 0.05, 0.2, 0.5],
 
     # unconditional sample len
     audio_len = int(22050*5), # unconditional_synthesis_samples #eigenverandering

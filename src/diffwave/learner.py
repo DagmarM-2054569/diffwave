@@ -111,7 +111,7 @@ class DiffWaveLearner:
         if self.is_master:
           if self.step % 50 == 0:
             self._write_summary(self.step, features, loss)
-          if self.step % 1000 == 0:#if self.step % (20*len(self.dataset)) == 0:   #TODO self: make 20 a parameter (originally not there or 1)
+          if self.step % 500 == 0:#if self.step % (20*len(self.dataset)) == 0:   #TODO self: make 20 a parameter (originally not there or 1)
             self.save_to_checkpoint()
         self.step += 1
 
