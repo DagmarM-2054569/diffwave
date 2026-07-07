@@ -94,42 +94,6 @@ audio, sample_rate = diffwave_predict(spectrogram, model_dir, fast_sampling=True
 python -m diffwave.inference --fast /path/to/model /path/to/spectrogram -o output.wav
 ```
 
-### Inverting audio into a conditioning spec
-You can also keep a trained conditional DiffWave checkpoint fixed and optimize only the
-conditioning `.spec.npy` tensor for a target wav:
-
-```
-python -m diffwave.invert /path/to/model /path/to/target.wav -o target.wav.spec.npy
-```
-
-This is similar in spirit to DeepDream: the network weights stay frozen, and gradient
-descent is applied to the input conditioning signal. The optimizer uses DiffWave's
-training denoising loss, so it searches for a spec that makes the fixed model predict
-the diffusion noise for the target audio.
-
-The inversion command above is all you need to convert a wav into a probable spec. If
-you want to listen to what the optimized spec produces, run the normal inference command
-as an optional round-trip check:
-
-```
-python -m diffwave.inference --fast /path/to/model -s target.wav.spec.npy -o reconstructed.wav
-```
-
-Useful options:
-```
-python -m diffwave.invert /path/to/model target.wav \
-  -o target.wav.spec.npy \
-  --steps 2000 \
-  --learning-rate 0.03 \
-  --crop-frames 256 \
-  --batch-size 2 \
-  --smoothness 0.001 \
-  --loss-csv inversion_loss.csv
-```
-
-The saved file has the same shape convention as preprocessing output:
-`[n_mels, frames]`, with values in `[0, 1]`.
-
 ## References
 - [DiffWave: A Versatile Diffusion Model for Audio Synthesis](https://arxiv.org/pdf/2009.09761.pdf)
 - [Denoising Diffusion Probabilistic Models](https://arxiv.org/pdf/2006.11239.pdf)
