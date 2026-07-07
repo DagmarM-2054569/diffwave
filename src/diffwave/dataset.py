@@ -24,6 +24,8 @@ import soundfile as sf
 from glob import glob
 from torch.utils.data.distributed import DistributedSampler
 
+from diffwave.cqt import cqt_audio_samples_for_conditioning, is_complex_cqt_target
+
 
 class ConditionalDataset(torch.utils.data.Dataset):
   def __init__(self, paths):
@@ -38,11 +40,12 @@ class ConditionalDataset(torch.utils.data.Dataset):
   def __getitem__(self, idx):
     audio_filename = self.filenames[idx]
     spec_filename = f'{audio_filename}.spec.npy'
-    signal, _ = load_audio(audio_filename)
+    signal, sample_rate = load_audio(audio_filename)
     spectrogram = np.load(spec_filename)
     return {
-        'audio': signal[0],
-        'spectrogram': spectrogram.T
+        'audio': signal[0].numpy(),
+        'spectrogram': spectrogram.T,
+        'sample_rate': sample_rate,
     }
 
 def load_audio(audio_filename):
@@ -65,10 +68,11 @@ class UnconditionalDataset(torch.utils.data.Dataset):
   def __getitem__(self, idx):
     audio_filename = self.filenames[idx]
     spec_filename = f'{audio_filename}.spec.npy'
-    signal, _ = load_audio(audio_filename)
+    signal, sample_rate = load_audio(audio_filename)
     return {
-        'audio': signal[0],
-        'spectrogram': None
+        'audio': signal[0].numpy(),
+        'spectrogram': None,
+        'sample_rate': sample_rate,
     }
 
 
@@ -76,9 +80,18 @@ class Collator:
   def __init__(self, params):
     self.params = params
 
+  def _drop_volume_row_if_requested(self, spectrogram):
+    if getattr(self.params, 'ignore_global_volume_row', False) and spectrogram.shape[0] > 0:
+      spectrogram = spectrogram.copy()
+      spectrogram[0, :] = 0.0
+    return spectrogram
+
   def collate(self, minibatch):
     samples_per_frame = self.params.hop_samples
     for record in minibatch:
+      if int(record.get('sample_rate', self.params.sample_rate)) != int(self.params.sample_rate):
+        raise ValueError(f"Invalid sample rate {record['sample_rate']}; expected {self.params.sample_rate}.")
+
       if self.params.unconditional:
           # Filter out records that aren't long enough.
           if len(record['audio']) < self.params.audio_len:
@@ -91,20 +104,27 @@ class Collator:
           record['audio'] = record['audio'][start:end]
           record['audio'] = np.pad(record['audio'], (0, (end - start) - len(record['audio'])), mode='constant')
       else:
+          if is_complex_cqt_target(self.params):
+            condition_frames = int(getattr(self.params, 'cqt_condition_frames', 0) or (int(self.params.audio_len) // samples_per_frame))
+            target_samples = cqt_audio_samples_for_conditioning(self.params, condition_frames)
+          else:
+            condition_frames = int(self.params.crop_mel_frames)
+            target_samples = condition_frames * samples_per_frame
+
           # Filter out records that aren't long enough.
-          if len(record['spectrogram']) < self.params.crop_mel_frames:
+          if len(record['spectrogram']) < condition_frames:
             del record['spectrogram']
             del record['audio']
             continue
 
-          start = random.randint(0, record['spectrogram'].shape[0] - self.params.crop_mel_frames)
-          end = start + self.params.crop_mel_frames
-          record['spectrogram'] = record['spectrogram'][start:end].T
+          start = random.randint(0, record['spectrogram'].shape[0] - condition_frames)
+          end = start + condition_frames
+          record['spectrogram'] = self._drop_volume_row_if_requested(record['spectrogram'][start:end].T)
 
           start *= samples_per_frame
-          end *= samples_per_frame
+          end = start + target_samples
           record['audio'] = record['audio'][start:end]
-          record['audio'] = np.pad(record['audio'], (0, (end-start) - len(record['audio'])), mode='constant')
+          record['audio'] = np.pad(record['audio'], (0, target_samples - len(record['audio'])), mode='constant')
 
     audio = np.stack([record['audio'] for record in minibatch if 'audio' in record])
     if self.params.unconditional:

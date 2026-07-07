@@ -1,0 +1,318 @@
+# Copyright 2020 LMNT, Inc. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# ==============================================================================
+
+import math
+
+import numpy as np
+import torch
+
+
+WAVEFORM_TARGET = 'waveform'
+COMPLEX_CQT_TARGET = 'complex_cqt'
+
+
+def midi_to_hz(note):
+  return 440.0 * (2.0 ** ((float(note) - 69.0) / 12.0))
+
+
+def target_representation(params):
+  return getattr(params, 'target_representation', WAVEFORM_TARGET)
+
+
+def is_complex_cqt_target(params):
+  return target_representation(params) == COMPLEX_CQT_TARGET
+
+
+def target_channel_count(params):
+  if is_complex_cqt_target(params):
+    return 2 * int(params.cqt_n_bins)
+  return 1
+
+
+def expected_cqt_frames(num_samples, hop_length):
+  hop_length = max(int(hop_length), 1)
+  return int(math.ceil(float(num_samples) / float(hop_length)))
+
+
+def cqt_audio_samples_for_conditioning(params, condition_frames=None):
+  if condition_frames is None:
+    condition_frames = getattr(params, 'cqt_condition_frames', None)
+  if condition_frames is None:
+    condition_frames = int(params.audio_len) // int(params.hop_samples)
+  return int(condition_frames) * int(params.hop_samples)
+
+
+def flatten_complex_cqt_target(target):
+  if target.ndim != 4:
+    raise ValueError(f'Expected complex CQT target [N, 2, F, T], got {tuple(target.shape)}.')
+  n, two, bins, frames = target.shape
+  if two != 2:
+    raise ValueError(f'Expected complex CQT target channel dimension to be 2, got {two}.')
+  return target.reshape(n, two * bins, frames)
+
+
+def unflatten_complex_cqt_target(target, n_bins):
+  if target.ndim != 3:
+    raise ValueError(f'Expected flattened complex CQT target [N, 2*F, T], got {tuple(target.shape)}.')
+  n, channels, frames = target.shape
+  expected_channels = 2 * int(n_bins)
+  if channels != expected_channels:
+    raise ValueError(f'Expected {expected_channels} channels for {n_bins} CQT bins, got {channels}.')
+  return target.reshape(n, 2, int(n_bins), frames)
+
+
+def _fix_time_axis_np(cqt, expected_frames):
+  frames = cqt.shape[-1]
+  if frames > expected_frames:
+    return cqt[..., :expected_frames]
+  if frames < expected_frames:
+    pad_width = [(0, 0)] * cqt.ndim
+    pad_width[-1] = (0, expected_frames - frames)
+    return np.pad(cqt, pad_width, mode='constant')
+  return cqt
+
+
+def _fix_time_axis_torch(cqt, expected_frames):
+  frames = cqt.shape[-1]
+  if frames > expected_frames:
+    return cqt[..., :expected_frames]
+  if frames < expected_frames:
+    pad = [0, expected_frames - frames]
+    return torch.nn.functional.pad(cqt, pad)
+  return cqt
+
+
+class ComplexCQTCodec:
+  """Creates normalized complex CQT targets and inverts them back to waveform."""
+
+  def __init__(self, params):
+    self.sample_rate = int(params.sample_rate)
+    self.n_bins = int(params.cqt_n_bins)
+    self.bins_per_octave = int(params.cqt_bins_per_octave)
+    self.hop_length = int(params.cqt_hop_length)
+    self.fmin = float(getattr(params, 'cqt_fmin', None) or midi_to_hz(21))
+    self.filter_scale = float(getattr(params, 'cqt_filter_scale', 1.0))
+    self.norm = getattr(params, 'cqt_norm', 1)
+    self.sparsity = float(getattr(params, 'cqt_sparsity', 0.01))
+    self.window = getattr(params, 'cqt_window', 'hann')
+    self.scale = bool(getattr(params, 'cqt_scale', True))
+    self.pad_mode = getattr(params, 'cqt_pad_mode', 'constant')
+    self.res_type = getattr(params, 'cqt_res_type', 'soxr_hq')
+    self.value_scale = float(getattr(params, 'cqt_value_scale', 8.0))
+    self.compression = float(getattr(params, 'cqt_compression', 10.0))
+    self.backend = getattr(params, 'cqt_backend', 'auto')
+    self._nnaudio_cqt = None
+
+  def to_target(self, audio, expected_frames=None):
+    if audio.ndim == 3 and audio.shape[1] == 1:
+      audio = audio[:, 0]
+    if audio.ndim != 2:
+      raise ValueError(f'Expected audio [N, T] or [N, 1, T], got {tuple(audio.shape)}.')
+    if expected_frames is None:
+      expected_frames = expected_cqt_frames(audio.shape[-1], self.hop_length)
+
+    if self._can_use_nnaudio(audio.device):
+      return self._to_target_nnaudio(audio, expected_frames)
+    return self._to_target_librosa(audio, expected_frames)
+
+  def target_to_audio(self, target, length=None, renderer='icqt'):
+    if isinstance(target, torch.Tensor):
+      target_np = target.detach().cpu().numpy()
+    else:
+      target_np = np.asarray(target)
+
+    squeeze_batch = False
+    if target_np.ndim == 3:
+      target_np = target_np[None, ...]
+      squeeze_batch = True
+    if target_np.ndim != 4 or target_np.shape[1] != 2:
+      raise ValueError(f'Expected target [N, 2, F, T] or [2, F, T], got {target_np.shape}.')
+
+    audio = []
+    for item in target_np:
+      complex_cqt = self._channels_to_complex_np(item)
+      if renderer == 'diagnostic':
+        y = self._diagnostic_griffinlim(complex_cqt, length)
+      elif renderer == 'icqt':
+        y = self._icqt(complex_cqt, length)
+      else:
+        raise ValueError(f'Unknown CQT renderer {renderer!r}. Use "icqt" or "diagnostic".')
+      audio.append(np.asarray(y, dtype=np.float32))
+
+    audio = np.stack(audio)
+    if squeeze_batch:
+      audio = audio[0]
+    return torch.from_numpy(audio)
+
+  def _can_use_nnaudio(self, device):
+    if self.backend == 'librosa':
+      return False
+    if device.type != 'cuda':
+      raise RuntimeError(
+          'Complex CQT target generation requires CUDA + nnAudio. Refusing to '
+          'fall back to CPU librosa. Install nnAudio and run training on a CUDA '
+          'device, or set cqt_backend="librosa" only for an explicit CPU diagnostic.'
+      )
+    try:
+      import nnAudio.Spectrogram  # noqa: F401
+    except ImportError as exc:
+      raise RuntimeError(
+          'nnAudio is not installed, and automatic CPU librosa fallback is disabled. '
+          'Install the optional GPU dependency with: pip install ".[cqt-gpu]".'
+      ) from exc
+    return True
+
+  def _get_nnaudio_cqt(self, device):
+    if self._nnaudio_cqt is None:
+      from nnAudio.Spectrogram import CQT1992v2
+      kwargs = dict(
+          sr=self.sample_rate,
+          hop_length=self.hop_length,
+          fmin=self.fmin,
+          n_bins=self.n_bins,
+          bins_per_octave=self.bins_per_octave,
+          trainable=False,
+          output_format='Complex',
+          pad_mode=self.pad_mode,
+      )
+      try:
+        self._nnaudio_cqt = CQT1992v2(**kwargs, verbose=False)
+      except TypeError:
+        self._nnaudio_cqt = CQT1992v2(**kwargs)
+      self._nnaudio_cqt.eval()
+    return self._nnaudio_cqt.to(device)
+
+  def _to_target_nnaudio(self, audio, expected_frames):
+    transform = self._get_nnaudio_cqt(audio.device)
+    with torch.no_grad():
+      cqt = transform(audio.float())
+      if torch.is_complex(cqt):
+        channels = torch.stack([cqt.real, cqt.imag], dim=1)
+      elif cqt.ndim == 4 and cqt.shape[-1] == 2:
+        channels = cqt.permute(0, 3, 1, 2)
+      elif cqt.ndim == 4 and cqt.shape[1] == 2:
+        channels = cqt
+      else:
+        raise RuntimeError(f'Unexpected nnAudio CQT output shape {tuple(cqt.shape)}.')
+      channels = _fix_time_axis_torch(channels, expected_frames)
+      return self._normalize_channels_torch(channels)
+
+  def _to_target_librosa(self, audio, expected_frames):
+    import librosa
+    audio_np = audio.detach().cpu().float().numpy()
+    batch = []
+    for item in audio_np:
+      cqt = librosa.cqt(
+          item,
+          sr=self.sample_rate,
+          hop_length=self.hop_length,
+          fmin=self.fmin,
+          n_bins=self.n_bins,
+          bins_per_octave=self.bins_per_octave,
+          filter_scale=self.filter_scale,
+          norm=self.norm,
+          sparsity=self.sparsity,
+          window=self.window,
+          scale=self.scale,
+          pad_mode=self.pad_mode,
+          res_type=self.res_type,
+          dtype=np.complex64,
+      )
+      cqt = _fix_time_axis_np(cqt, expected_frames)
+      channels = self._complex_to_channels_np(cqt)
+      batch.append(channels)
+    target = torch.from_numpy(np.stack(batch))
+    target = target.to(device=audio.device, dtype=torch.float32)
+    return target
+
+  def _normalize_channels_torch(self, channels):
+    channels = channels.float() / self.value_scale
+    if self.compression <= 0.0:
+      return channels
+    real = channels[:, 0]
+    imag = channels[:, 1]
+    magnitude = torch.sqrt(real * real + imag * imag)
+    compressed = torch.log1p(self.compression * magnitude) / math.log1p(self.compression)
+    factor = compressed / torch.clamp(magnitude, min=1e-12)
+    normalized = torch.stack([real * factor, imag * factor], dim=1)
+    return torch.where(magnitude.unsqueeze(1) > 0.0, normalized, torch.zeros_like(normalized))
+
+  def _denormalize_channels_np(self, channels):
+    channels = np.asarray(channels, dtype=np.float32)
+    if self.compression <= 0.0:
+      return channels * self.value_scale
+    real = channels[0]
+    imag = channels[1]
+    magnitude = np.sqrt(real * real + imag * imag)
+    restored_mag = np.expm1(magnitude * math.log1p(self.compression)) / self.compression
+    factor = restored_mag / np.maximum(magnitude, 1e-12)
+    restored = np.stack([real * factor, imag * factor], axis=0)
+    restored = np.where(magnitude[None, ...] > 0.0, restored, 0.0)
+    return restored * self.value_scale
+
+  def _complex_to_channels_np(self, cqt):
+    channels = np.stack([np.real(cqt), np.imag(cqt)], axis=0).astype(np.float32, copy=False)
+    channels = channels / self.value_scale
+    if self.compression <= 0.0:
+      return channels
+    real = channels[0]
+    imag = channels[1]
+    magnitude = np.sqrt(real * real + imag * imag)
+    compressed = np.log1p(self.compression * magnitude) / math.log1p(self.compression)
+    factor = compressed / np.maximum(magnitude, 1e-12)
+    normalized = np.stack([real * factor, imag * factor], axis=0)
+    return np.where(magnitude[None, ...] > 0.0, normalized, 0.0).astype(np.float32, copy=False)
+
+  def _channels_to_complex_np(self, channels):
+    restored = self._denormalize_channels_np(channels)
+    return restored[0].astype(np.float32) + 1j * restored[1].astype(np.float32)
+
+  def _icqt(self, complex_cqt, length):
+    import librosa
+    return librosa.icqt(
+        complex_cqt,
+        sr=self.sample_rate,
+        hop_length=self.hop_length,
+        fmin=self.fmin,
+        bins_per_octave=self.bins_per_octave,
+        filter_scale=self.filter_scale,
+        norm=self.norm,
+        sparsity=self.sparsity,
+        window=self.window,
+        scale=self.scale,
+        res_type=self.res_type,
+        length=length,
+      )
+
+  def _diagnostic_griffinlim(self, complex_cqt, length):
+    import librosa
+    magnitude = np.abs(complex_cqt)
+    if length is not None:
+      native_frames = 1 + int(length) // max(int(self.hop_length), 1)
+      magnitude = _fix_time_axis_np(magnitude, native_frames)
+    return librosa.griffinlim_cqt(
+        magnitude,
+        sr=self.sample_rate,
+        hop_length=self.hop_length,
+        fmin=self.fmin,
+        bins_per_octave=self.bins_per_octave,
+        filter_scale=self.filter_scale,
+        norm=self.norm,
+        sparsity=self.sparsity,
+        window=self.window,
+        scale=self.scale,
+        length=length,
+        n_iter=32,
+      )

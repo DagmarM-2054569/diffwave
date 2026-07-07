@@ -34,9 +34,10 @@ class AttrDict(dict):
 
 params = AttrDict(
     # Training params
-    batch_size=15,   #eigenverandering (2)   29 causes memory crash
-    learning_rate=4e-5, #eigenverandering 2e-4 -> 2e-5
+    batch_size=1,   #eigenverandering (2)   29 causes memory crash
+    learning_rate=3e-5, #eigenverandering 2e-4 -> 2e-5
     max_grad_norm=None,
+    charbonnier_eps=1e-3,
 
     # Data params
     sample_rate=22050,
@@ -44,6 +45,26 @@ params = AttrDict(
     n_fft=1024,
     hop_samples=256,
     crop_mel_frames=256,  # Probably an error in paper. eigenverandering 62->160
+    ignore_global_volume_row=False,
+
+    # Diffusion target params. The symbolic .spec.npy files remain conditioning;
+    # the complex CQT target is computed from the cropped WAV during training.
+    target_representation='complex_cqt',
+    cqt_backend='auto',
+    cqt_n_bins=89,
+    cqt_bins_per_octave=12,
+    cqt_hop_length=1,
+    cqt_fmin=27.5,
+    cqt_filter_scale=1.0,
+    cqt_norm=1,
+    cqt_sparsity=0.01,
+    cqt_window='hann',
+    cqt_scale=True,
+    cqt_pad_mode='constant',
+    cqt_res_type='soxr_hq',
+    cqt_value_scale=8.0,
+    cqt_compression=10.0,
+    cqt_condition_frames=int(22050 * 5) // 256,
 
     # Model params
     residual_layers=39,       #eigenverandering 30->39

@@ -55,6 +55,11 @@ setup(name = 'diffwave',
         'numpy',
         'torch>=1.6',
         'torchaudio>=0.9.0',
+        'librosa',
+        'soundfile',
         'tqdm'
     ],
+    extras_require={
+        'cqt-gpu': ['nnAudio>=0.3.3'],
+    },
     classifiers = CLASSIFIERS)

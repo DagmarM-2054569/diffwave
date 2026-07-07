@@ -24,7 +24,11 @@ License-File: LICENSE
 Requires-Dist: numpy
 Requires-Dist: torch>=1.6
 Requires-Dist: torchaudio>=0.9.0
+Requires-Dist: librosa
+Requires-Dist: soundfile
 Requires-Dist: tqdm
+Provides-Extra: cqt-gpu
+Requires-Dist: nnAudio>=0.3.3; extra == "cqt-gpu"
 Dynamic: author
 Dynamic: author-email
 Dynamic: classifier
@@ -34,6 +38,7 @@ Dynamic: home-page
 Dynamic: keywords
 Dynamic: license
 Dynamic: license-file
+Dynamic: provides-extra
 Dynamic: requires-dist
 Dynamic: summary
 
@@ -111,6 +116,68 @@ tensorboard --logdir /path/to/model/dir --bind_all
 ```
 
 You should expect to hear intelligible (but noisy) speech by ~8k steps (~1.5h on a 2080 Ti).
+
+### Complex CQT target training
+This checkout can train a symbolic-conditioning model whose diffusion target is a
+complex CQT instead of a waveform. In this mode, the existing `.wav.spec.npy`
+files are still the symbolic piano-roll-like conditioning files. They are not
+replaced by CQT files. For each cropped WAV segment, training computes a
+normalized complex CQT target shaped `[2, 89, T]`, where channel `0` is real and
+channel `1` is imaginary. The default CQT settings are 22.05 kHz, 12 bins per
+octave, 89 bins, `fmin=27.5`, and `hop_length=1`.
+
+The model flattens `[2, 89, T]` to `[178, T]` internally. The symbolic
+conditioner still upsamples by `hop_samples`, so CQT crops use
+`cqt_condition_frames * hop_samples` audio samples. With the defaults, that is
+`430 * 256 = 110080` samples, which is the existing 5-second crop rounded down
+to the conditioning grid.
+
+Use Charbonnier noise-prediction loss:
+
+```
+loss = mean(sqrt((predicted_noise - true_noise)^2 + charbonnier_eps^2) - charbonnier_eps)
+```
+
+`charbonnier_eps` defaults to `1e-3`. The CQT values are divided by
+`cqt_value_scale=8.0` and then compressed with an invertible `log1p` magnitude
+compression (`cqt_compression=10.0`), so the inverse renderer can undo the
+normalization before waveform reconstruction.
+
+For early runs where the dense WAV-derived conditioning row is a shortcut, pass:
+
+```
+python -m diffwave /path/to/model/dir /path/to/data --ignore_global_volume_row
+```
+
+This zeros conditioning row `0` only. MIDI pitch rows and their velocity-derived
+note intensities are kept intact. Later refinement runs can omit the flag.
+
+`cqt_backend=auto` requires `nnAudio` on a CUDA tensor. It intentionally refuses
+to fall back to CPU `librosa`, so a missing GPU CQT path fails fast instead of
+quietly starting a slow CPU training run. Install the optional GPU CQT
+dependency with:
+
+```
+pip install ".[cqt-gpu]"
+```
+
+Use `--cqt_backend librosa` only for explicit short CPU diagnostics.
+
+Inference samples a complex CQT target and renders it to WAV with `librosa.icqt`
+by default:
+
+```
+python -m diffwave.inference /path/to/model -s /path/to/file.wav.spec.npy -o output.wav
+```
+
+The alternate renderer is explicitly diagnostic:
+
+```
+python -m diffwave.inference /path/to/model -s /path/to/file.wav.spec.npy -o diagnostic.wav --cqt_renderer diagnostic
+```
+
+`--cqt_renderer diagnostic` uses magnitude-only CQT Griffin-Lim and is not a
+mathematically exact inverse of the predicted complex CQT.
 
 #### Multi-GPU training
 By default, this implementation uses as many GPUs in parallel as returned by [`torch.cuda.device_count()`](https://pytorch.org/docs/stable/cuda.html#torch.cuda.device_count). You can specify which GPUs to use by setting the [`CUDA_DEVICES_AVAILABLE`](https://developer.nvidia.com/blog/cuda-pro-tip-control-gpu-visibility-cuda_visible_devices/) environment variable before running the training module.

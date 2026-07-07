@@ -17,6 +17,7 @@ from argparse import ArgumentParser
 from torch.cuda import device_count
 from torch.multiprocessing import spawn
 
+from diffwave.cqt import COMPLEX_CQT_TARGET, WAVEFORM_TARGET
 from diffwave.learner import train, train_distributed
 from diffwave.params import params
 
@@ -28,6 +29,18 @@ def _get_free_port():
 
 
 def main(args):
+  overrides = {
+      key: value for key, value in {
+          'target_representation': args.target_representation,
+          'charbonnier_eps': args.charbonnier_eps,
+          'cqt_backend': args.cqt_backend,
+          'cqt_condition_frames': args.cqt_condition_frames,
+      }.items() if value is not None
+  }
+  if args.ignore_global_volume_row:
+    overrides['ignore_global_volume_row'] = True
+  params.override(overrides)
+
   replica_count = device_count()
   if replica_count > 1:
     if params.batch_size % replica_count != 0:
@@ -49,4 +62,14 @@ if __name__ == '__main__':
       help='maximum number of training steps')
   parser.add_argument('--fp16', action='store_true', default=False,
       help='use 16-bit floating point operations for training')
+  parser.add_argument('--target_representation', choices=[WAVEFORM_TARGET, COMPLEX_CQT_TARGET],
+      help='diffusion target representation; defaults to params.py')
+  parser.add_argument('--charbonnier_eps', default=None, type=float,
+      help='epsilon for Charbonnier noise-prediction loss')
+  parser.add_argument('--cqt_backend', choices=['auto', 'nnaudio', 'librosa'],
+      help='CQT backend for complex_cqt target generation; auto/nnaudio require CUDA + nnAudio, librosa is explicit CPU diagnostic mode')
+  parser.add_argument('--cqt_condition_frames', default=None, type=int,
+      help='number of symbolic conditioning frames per CQT training crop')
+  parser.add_argument('--ignore_global_volume_row', action='store_true',
+      help='zero symbolic conditioning row 0 while keeping MIDI velocity pitch rows')
   main(parser.parse_args())

@@ -22,6 +22,12 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from diffwave.cqt import (
+    ComplexCQTCodec,
+    expected_cqt_frames,
+    flatten_complex_cqt_target,
+    is_complex_cqt_target,
+)
 from diffwave.dataset import from_path, from_gtzan
 from diffwave.model import DiffWave
 from diffwave.params import AttrDict
@@ -35,6 +41,10 @@ def _nested_map(struct, map_fn):
   if isinstance(struct, dict):
     return { k: _nested_map(v, map_fn) for k, v in struct.items() }
   return map_fn(struct)
+
+
+def charbonnier_loss(error, eps):
+  return (torch.sqrt(error * error + eps * eps) - eps).mean()
 
 
 class DiffWaveLearner:
@@ -53,7 +63,7 @@ class DiffWaveLearner:
     beta = np.array(self.params.noise_schedule)
     noise_level = np.cumprod(1 - beta)
     self.noise_level = torch.tensor(noise_level.astype(np.float32))
-    self.loss_fn = nn.L1Loss()
+    self.cqt_codec = ComplexCQTCodec(params) if is_complex_cqt_target(params) else None
     self.summary_writer = None
 
   def state_dict(self):
@@ -121,20 +131,21 @@ class DiffWaveLearner:
 
     audio = features['audio']
     spectrogram = features['spectrogram']
+    diffusion_target = self._build_diffusion_target(audio)
 
-    N, T = audio.shape
+    N = diffusion_target.shape[0]
     device = audio.device
     self.noise_level = self.noise_level.to(device)
 
     with self.autocast:
       t = torch.randint(0, len(self.params.noise_schedule), [N], device=audio.device)
-      noise_scale = self.noise_level[t].unsqueeze(1)
+      noise_scale = self.noise_level[t].reshape(N, *([1] * (diffusion_target.ndim - 1)))
       noise_scale_sqrt = noise_scale**0.5
-      noise = torch.randn_like(audio)
-      noisy_audio = noise_scale_sqrt * audio + (1.0 - noise_scale)**0.5 * noise
+      noise = torch.randn_like(diffusion_target)
+      noisy_target = noise_scale_sqrt * diffusion_target + (1.0 - noise_scale)**0.5 * noise
 
-      predicted = self.model(noisy_audio, t, spectrogram)
-      loss = self.loss_fn(noise, predicted.squeeze(1))
+      predicted = self.model(noisy_target, t, spectrogram)
+      loss = charbonnier_loss(predicted - noise, float(self.params.charbonnier_eps))
 
     self.scaler.scale(loss).backward()
     self.scaler.unscale_(self.optimizer)
@@ -142,6 +153,13 @@ class DiffWaveLearner:
     self.scaler.step(self.optimizer)
     self.scaler.update()
     return loss
+
+  def _build_diffusion_target(self, audio):
+    if self.cqt_codec is None:
+      return audio.unsqueeze(1)
+    expected_frames = expected_cqt_frames(audio.shape[-1], self.params.cqt_hop_length)
+    cqt_target = self.cqt_codec.to_target(audio, expected_frames=expected_frames)
+    return flatten_complex_cqt_target(cqt_target)
 
   def _write_summary(self, step, features, loss):
     writer = self.summary_writer or SummaryWriter(self.model_dir, purge_step=step)

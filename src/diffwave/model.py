@@ -20,6 +20,8 @@ import torch.nn.functional as F
 
 from math import sqrt
 
+from diffwave.cqt import target_channel_count
+
 
 Linear = nn.Linear
 ConvTranspose2d = nn.ConvTranspose2d
@@ -155,7 +157,8 @@ class DiffWave(nn.Module):
   def __init__(self, params):
     super().__init__()
     self.params = params
-    self.input_projection = Conv1d(1, params.residual_channels, 1)
+    self.diffusion_channels = target_channel_count(params)
+    self.input_projection = Conv1d(self.diffusion_channels, params.residual_channels, 1)
     self.diffusion_embedding = DiffusionEmbedding(len(params.noise_schedule))
 
     if self.params.unconditional:
@@ -175,13 +178,29 @@ class DiffWave(nn.Module):
         for i in range(params.residual_layers)
     ])
     self.skip_projection = Conv1d(params.residual_channels, params.residual_channels, 1)
-    self.output_projection = Conv1d(params.residual_channels, 1, 1)
+    self.output_projection = Conv1d(params.residual_channels, self.diffusion_channels, 1)
     nn.init.zeros_(self.output_projection.weight)
+
+  def _prepare_diffusion_input(self, target):
+    if target.ndim == 2:
+      if self.diffusion_channels != 1:
+        raise ValueError(f'Expected {self.diffusion_channels} diffusion channels, got waveform [N, T].')
+      return target.unsqueeze(1)
+    if target.ndim == 3:
+      if target.shape[1] != self.diffusion_channels:
+        raise ValueError(f'Expected {self.diffusion_channels} diffusion channels, got {target.shape[1]}.')
+      return target
+    if target.ndim == 4:
+      n, channels, bins, frames = target.shape
+      if channels * bins != self.diffusion_channels:
+        raise ValueError(f'Expected {self.diffusion_channels} flattened channels, got {channels}x{bins}.')
+      return target.reshape(n, channels * bins, frames)
+    raise ValueError(f'Expected diffusion target [N, T], [N, C, T], or [N, 2, F, T], got {tuple(target.shape)}.')
 
   def forward(self, audio, diffusion_step, spectrogram=None):
     assert (spectrogram is None and self.conditioner_encoder is None) or \
            (spectrogram is not None and self.conditioner_encoder is not None)
-    x = audio.unsqueeze(1)
+    x = self._prepare_diffusion_input(audio)
     x = self.input_projection(x)
     x = F.relu(x)
 
@@ -189,6 +208,11 @@ class DiffWave(nn.Module):
     conditioner = None
     if self.conditioner_encoder:
       conditioner = self.conditioner_encoder(spectrogram)
+      if conditioner.shape[-1] != x.shape[-1]:
+        if conditioner.shape[-1] > x.shape[-1]:
+          conditioner = conditioner[..., :x.shape[-1]]
+        else:
+          conditioner = F.pad(conditioner, (0, x.shape[-1] - conditioner.shape[-1]))
 
     skip = None
     for layer in self.residual_layers:
