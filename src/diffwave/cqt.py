@@ -127,7 +127,10 @@ class ComplexCQTCodec:
       return self._to_target_nnaudio(audio, expected_frames)
     return self._to_target_librosa(audio, expected_frames)
 
-  def target_to_audio(self, target, length=None, renderer='icqt'):
+  def target_to_audio(self, target, length=None, renderer='sum_real'):
+    if renderer == 'sum_real':
+      return self._sum_real_audio(target, length)
+
     if isinstance(target, torch.Tensor):
       target_np = target.detach().cpu().numpy()
     else:
@@ -148,13 +151,51 @@ class ComplexCQTCodec:
       elif renderer == 'icqt':
         y = self._icqt(complex_cqt, length)
       else:
-        raise ValueError(f'Unknown CQT renderer {renderer!r}. Use "icqt" or "diagnostic".')
+        raise ValueError(f'Unknown CQT renderer {renderer!r}. Use "sum_real", "icqt", or "diagnostic".')
       audio.append(np.asarray(y, dtype=np.float32))
 
     audio = np.stack(audio)
     if squeeze_batch:
       audio = audio[0]
     return torch.from_numpy(audio)
+
+  def _sum_real_audio(self, target, length):
+    if isinstance(target, torch.Tensor):
+      squeeze_batch = False
+      if target.ndim == 3:
+        target = target.unsqueeze(0)
+        squeeze_batch = True
+      if target.ndim != 4 or target.shape[1] != 2:
+        raise ValueError(f'Expected target [N, 2, F, T] or [2, F, T], got {tuple(target.shape)}.')
+
+      audio = target[:, 0].float().sum(dim=1)
+      audio = _fix_time_axis_torch(audio, length) if length is not None else audio
+      audio = self._peak_normalize_torch(audio)
+      if squeeze_batch:
+        audio = audio[0]
+      return audio.detach().cpu()
+
+    target_np = np.asarray(target, dtype=np.float32)
+    squeeze_batch = False
+    if target_np.ndim == 3:
+      target_np = target_np[None, ...]
+      squeeze_batch = True
+    if target_np.ndim != 4 or target_np.shape[1] != 2:
+      raise ValueError(f'Expected target [N, 2, F, T] or [2, F, T], got {target_np.shape}.')
+
+    audio = target_np[:, 0].sum(axis=1)
+    audio = _fix_time_axis_np(audio, length) if length is not None else audio
+    peak = np.max(np.abs(audio), axis=-1, keepdims=True)
+    audio = np.where(peak > 1e-8, audio / peak * 0.95, audio)
+    audio = np.clip(audio, -1.0, 1.0).astype(np.float32, copy=False)
+    if squeeze_batch:
+      audio = audio[0]
+    return torch.from_numpy(audio)
+
+  def _peak_normalize_torch(self, audio):
+    peak = audio.abs().amax(dim=-1, keepdim=True)
+    audio = torch.where(peak > 1e-8, audio / peak * 0.95, audio)
+    return torch.clamp(audio, -1.0, 1.0)
 
   def _can_use_nnaudio(self, device):
     if self.backend == 'librosa':

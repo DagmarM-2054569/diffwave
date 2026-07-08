@@ -119,11 +119,20 @@ pip install ".[cqt-gpu]"
 
 Use `--cqt_backend librosa` only for explicit short CPU diagnostics.
 
-Inference samples a complex CQT target and renders it to WAV with `librosa.icqt`
-by default:
+Inference samples a complex CQT target and renders it to WAV with the low-memory
+`sum_real` renderer by default. This simply sums channel `0` (the predicted real
+CQT component) over the 89 bins for each time step, then peak-normalizes to WAV
+range. It is not a mathematically exact inverse CQT, but it avoids the huge
+hop-1 `librosa.icqt` workspace.
 
 ```
 python -m diffwave.inference /path/to/model -s /path/to/file.wav.spec.npy -o output.wav
+```
+
+The exact inverse renderer is still available for short reconstruction tests:
+
+```
+python -m diffwave.inference /path/to/model -s /path/to/file.wav.spec.npy -o icqt.wav --cqt_renderer icqt
 ```
 
 The alternate renderer is explicitly diagnostic:

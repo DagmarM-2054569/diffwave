@@ -71,7 +71,7 @@ def _prepare_spectrogram(spectrogram, params, device):
   return spectrogram.to(device)
 
 
-def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), fast_sampling=False, cqt_renderer='icqt'):
+def predict(spectrogram=None, model_dir=None, params=None, device=torch.device('cuda'), fast_sampling=False, cqt_renderer='sum_real'):
   model = _load_model(model_dir, params, device)
   with torch.no_grad():
     # Change in notation from the DiffWave paper for fast sampling.
@@ -169,8 +169,8 @@ if __name__ == '__main__':
       help='override checkpoint target representation')
   parser.add_argument('--cqt_backend', choices=['auto', 'nnaudio', 'librosa'],
       help='CQT backend override for complex CQT models')
-  parser.add_argument('--cqt_renderer', choices=['icqt', 'diagnostic'], default='icqt',
-      help='renderer for complex CQT output; diagnostic uses magnitude-only Griffin-Lim and is not an exact inverse')
+  parser.add_argument('--cqt_renderer', choices=['sum_real', 'icqt', 'diagnostic'], default='sum_real',
+      help='renderer for complex CQT output; sum_real is the low-memory default, icqt is the expensive inverse, diagnostic uses magnitude-only Griffin-Lim')
   parser.add_argument('--ignore_global_volume_row', action='store_true',
       help='zero conditioning row 0 before inference')
   main(parser.parse_args())
