@@ -47,6 +47,20 @@ def charbonnier_loss(error, eps):
   return (torch.sqrt(error * error + eps * eps) - eps).mean()
 
 
+def diffusion_prediction_target(prediction_type, clean_target, noise, noise_scale):
+  if prediction_type == 'epsilon':
+    return noise
+  if prediction_type == 'v_prediction':
+    return noise_scale.sqrt() * noise - (1.0 - noise_scale).sqrt() * clean_target
+  raise ValueError(f'Unsupported prediction_type {prediction_type!r}.')
+
+
+def _sequence_param_matches(checkpoint_value, current_value):
+  checkpoint_value = np.asarray(checkpoint_value, dtype=np.float64)
+  current_value = np.asarray(current_value, dtype=np.float64)
+  return checkpoint_value.shape == current_value.shape and np.allclose(checkpoint_value, current_value)
+
+
 class DiffWaveLearner:
   def __init__(self, model_dir, model, dataset, optimizer, params, *args, **kwargs):
     os.makedirs(model_dir, exist_ok=True)
@@ -103,6 +117,21 @@ class DiffWaveLearner:
   def restore_from_checkpoint(self, filename='weights'):
     try:
       checkpoint = torch.load(f'{self.model_dir}/{filename}.pt')
+      checkpoint_params = checkpoint.get('params', {})
+      checkpoint_prediction_type = checkpoint_params.get('prediction_type', 'epsilon')
+      current_prediction_type = getattr(self.params, 'prediction_type', 'epsilon')
+      if checkpoint_prediction_type != current_prediction_type:
+        raise ValueError(
+            f'Checkpoint prediction_type={checkpoint_prediction_type!r} does not match '
+            f'current prediction_type={current_prediction_type!r}. Use a fresh model_dir '
+            'when changing the diffusion prediction objective.'
+        )
+      if 'noise_schedule' in checkpoint_params and not _sequence_param_matches(
+          checkpoint_params['noise_schedule'], self.params.noise_schedule):
+        raise ValueError(
+            'Checkpoint noise_schedule does not match the current params.py schedule. '
+            'Use a fresh model_dir when changing the diffusion noise schedule.'
+        )
       self.load_state_dict(checkpoint)
       return True
     except FileNotFoundError:
@@ -143,9 +172,10 @@ class DiffWaveLearner:
       noise_scale_sqrt = noise_scale**0.5
       noise = torch.randn_like(diffusion_target)
       noisy_target = noise_scale_sqrt * diffusion_target + (1.0 - noise_scale)**0.5 * noise
+      target = diffusion_prediction_target(self.params.prediction_type, diffusion_target, noise, noise_scale)
 
       predicted = self.model(noisy_target, t, spectrogram)
-      loss = charbonnier_loss(predicted - noise, float(self.params.charbonnier_eps))
+      loss = charbonnier_loss(predicted - target, float(self.params.charbonnier_eps))
 
     self.scaler.scale(loss).backward()
     self.scaler.unscale_(self.optimizer)

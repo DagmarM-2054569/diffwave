@@ -32,6 +32,7 @@ def main(args):
   overrides = {
       key: value for key, value in {
           'target_representation': args.target_representation,
+          'prediction_type': args.prediction_type,
           'charbonnier_eps': args.charbonnier_eps,
           'cqt_backend': args.cqt_backend,
           'cqt_condition_frames': args.cqt_condition_frames,
@@ -64,6 +65,8 @@ if __name__ == '__main__':
       help='use 16-bit floating point operations for training')
   parser.add_argument('--target_representation', choices=[WAVEFORM_TARGET, COMPLEX_CQT_TARGET],
       help='diffusion target representation; defaults to params.py')
+  parser.add_argument('--prediction_type', choices=['epsilon', 'v_prediction'],
+      help='diffusion prediction objective; defaults to params.py')
   parser.add_argument('--charbonnier_eps', default=None, type=float,
       help='epsilon for Charbonnier noise-prediction loss')
   parser.add_argument('--cqt_backend', choices=['auto', 'nnaudio', 'librosa'],

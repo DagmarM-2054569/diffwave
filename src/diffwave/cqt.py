@@ -14,6 +14,9 @@
 # ==============================================================================
 
 import math
+import struct
+import zlib
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -159,6 +162,61 @@ class ComplexCQTCodec:
       audio = audio[0]
     return torch.from_numpy(audio)
 
+  def save_real_component_png(self, target, output_path, seconds=0.1, batch_index=0):
+    real = self.real_component_crop_for_png(target, seconds=seconds, batch_index=batch_index)
+    image = self._real_values_to_red_blue_image(real)
+    _write_rgb_png(output_path, image)
+
+  def real_component_crop_for_png(self, target, seconds=0.1, batch_index=0):
+    if isinstance(target, torch.Tensor):
+      if target.ndim == 3:
+        target = target.unsqueeze(0)
+      if target.ndim != 4 or target.shape[1] != 2:
+        raise ValueError(f'Expected target [N, 2, F, T] or [2, F, T], got {tuple(target.shape)}.')
+      if not 0 <= int(batch_index) < target.shape[0]:
+        raise IndexError(f'batch_index {batch_index} is out of range for batch size {target.shape[0]}.')
+      start, end = self._middle_time_bounds(target.shape[-1], seconds)
+      cropped = target[int(batch_index):int(batch_index) + 1, :, :, start:end]
+      restored = self._denormalize_channels_torch(cropped.float())
+      real = restored[0, 0]
+      return real.detach().cpu().numpy().astype(np.float32, copy=False)
+
+    target_np = np.asarray(target, dtype=np.float32)
+    if target_np.ndim == 3:
+      target_np = target_np[None, ...]
+    if target_np.ndim != 4 or target_np.shape[1] != 2:
+      raise ValueError(f'Expected target [N, 2, F, T] or [2, F, T], got {target_np.shape}.')
+    if not 0 <= int(batch_index) < target_np.shape[0]:
+      raise IndexError(f'batch_index {batch_index} is out of range for batch size {target_np.shape[0]}.')
+    start, end = self._middle_time_bounds(target_np.shape[-1], seconds)
+    cropped = target_np[int(batch_index):int(batch_index) + 1, :, :, start:end]
+    restored = self._denormalize_channels_np(cropped)
+    real = restored[0, 0]
+    return real
+
+  def _middle_time_bounds(self, available_frames, seconds):
+    frames = self._png_frame_count(seconds, available_frames)
+    start = max((int(available_frames) - frames) // 2, 0)
+    return start, start + frames
+
+  def _png_frame_count(self, seconds, available_frames):
+    requested = int(round(float(seconds) * float(self.sample_rate) / float(self.hop_length)))
+    requested = max(requested, 1)
+    return min(requested, int(available_frames))
+
+  def _real_values_to_red_blue_image(self, real):
+    real = np.asarray(real, dtype=np.float32)
+    if real.ndim != 2:
+      raise ValueError(f'Expected real CQT crop [F, T], got {real.shape}.')
+    scale = float(np.max(np.abs(real))) if real.size else 0.0
+    if scale <= 0.0:
+      return np.zeros((*real.shape, 3), dtype=np.uint8)
+    normalized = np.clip(real / scale, -1.0, 1.0)
+    image = np.zeros((*normalized.shape, 3), dtype=np.uint8)
+    image[..., 0] = np.where(normalized < 0.0, np.rint(-normalized * 255.0), 0.0).astype(np.uint8)
+    image[..., 2] = np.where(normalized > 0.0, np.rint(normalized * 255.0), 0.0).astype(np.uint8)
+    return image
+
   def _sum_real_audio(self, target, length):
     if isinstance(target, torch.Tensor):
       squeeze_batch = False
@@ -168,7 +226,8 @@ class ComplexCQTCodec:
       if target.ndim != 4 or target.shape[1] != 2:
         raise ValueError(f'Expected target [N, 2, F, T] or [2, F, T], got {tuple(target.shape)}.')
 
-      audio = target[:, 0].float().sum(dim=1)
+      restored = self._denormalize_channels_torch(target.float())
+      audio = restored[:, 0].sum(dim=1)
       audio = _fix_time_axis_torch(audio, length) if length is not None else audio
       audio = self._peak_normalize_torch(audio)
       if squeeze_batch:
@@ -183,7 +242,8 @@ class ComplexCQTCodec:
     if target_np.ndim != 4 or target_np.shape[1] != 2:
       raise ValueError(f'Expected target [N, 2, F, T] or [2, F, T], got {target_np.shape}.')
 
-    audio = target_np[:, 0].sum(axis=1)
+    restored = self._denormalize_channels_np(target_np)
+    audio = restored[:, 0].sum(axis=1)
     audio = _fix_time_axis_np(audio, length) if length is not None else audio
     peak = np.max(np.abs(audio), axis=-1, keepdims=True)
     audio = np.where(peak > 1e-8, audio / peak * 0.95, audio)
@@ -294,13 +354,42 @@ class ComplexCQTCodec:
     channels = np.asarray(channels, dtype=np.float32)
     if self.compression <= 0.0:
       return channels * self.value_scale
-    real = channels[0]
-    imag = channels[1]
+    if channels.ndim == 3:
+      channel_axis = 0
+      real = channels[0]
+      imag = channels[1]
+    elif channels.ndim == 4:
+      channel_axis = 1
+      real = channels[:, 0]
+      imag = channels[:, 1]
+    else:
+      raise ValueError(f'Expected normalized CQT channels [2, F, T] or [N, 2, F, T], got {channels.shape}.')
     magnitude = np.sqrt(real * real + imag * imag)
     restored_mag = np.expm1(magnitude * math.log1p(self.compression)) / self.compression
     factor = restored_mag / np.maximum(magnitude, 1e-12)
-    restored = np.stack([real * factor, imag * factor], axis=0)
-    restored = np.where(magnitude[None, ...] > 0.0, restored, 0.0)
+    restored = np.stack([real * factor, imag * factor], axis=channel_axis)
+    restored = np.where(np.expand_dims(magnitude > 0.0, axis=channel_axis), restored, 0.0)
+    return restored * self.value_scale
+
+  def _denormalize_channels_torch(self, channels):
+    channels = channels.float()
+    if self.compression <= 0.0:
+      return channels * self.value_scale
+    if channels.ndim == 3:
+      channel_axis = 0
+      real = channels[0]
+      imag = channels[1]
+    elif channels.ndim == 4:
+      channel_axis = 1
+      real = channels[:, 0]
+      imag = channels[:, 1]
+    else:
+      raise ValueError(f'Expected normalized CQT channels [2, F, T] or [N, 2, F, T], got {tuple(channels.shape)}.')
+    magnitude = torch.sqrt(real * real + imag * imag)
+    restored_mag = torch.expm1(magnitude * math.log1p(self.compression)) / self.compression
+    factor = restored_mag / torch.clamp(magnitude, min=1e-12)
+    restored = torch.stack([real * factor, imag * factor], dim=channel_axis)
+    restored = torch.where(torch.unsqueeze(magnitude > 0.0, dim=channel_axis), restored, torch.zeros_like(restored))
     return restored * self.value_scale
 
   def _complex_to_channels_np(self, cqt):
@@ -357,3 +446,29 @@ class ComplexCQTCodec:
         length=length,
         n_iter=32,
       )
+
+
+def _write_rgb_png(output_path, image):
+  image = np.asarray(image, dtype=np.uint8)
+  if image.ndim != 3 or image.shape[2] != 3:
+    raise ValueError(f'Expected RGB image [H, W, 3], got {image.shape}.')
+  height, width, _ = image.shape
+  output_path = Path(output_path)
+  output_path.parent.mkdir(parents=True, exist_ok=True)
+
+  def chunk(chunk_type, data):
+    return (
+        struct.pack('>I', len(data)) +
+        chunk_type +
+        data +
+        struct.pack('>I', zlib.crc32(chunk_type + data) & 0xffffffff)
+    )
+
+  raw_rows = [b'\x00' + image[row].tobytes() for row in range(height)]
+  png = (
+      b'\x89PNG\r\n\x1a\n' +
+      chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) +
+      chunk(b'IDAT', zlib.compress(b''.join(raw_rows), level=9)) +
+      chunk(b'IEND', b'')
+  )
+  output_path.write_bytes(png)

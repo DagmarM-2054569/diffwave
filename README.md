@@ -88,16 +88,30 @@ conditioner still upsamples by `hop_samples`, so CQT crops use
 `430 * 256 = 110080` samples, which is the existing 5-second crop rounded down
 to the conditioning grid.
 
-Use Charbonnier noise-prediction loss:
+By default this branch trains with v-prediction. The diffusion target is:
 
 ```
-loss = mean(sqrt((predicted_noise - true_noise)^2 + charbonnier_eps^2) - charbonnier_eps)
+v = sqrt(alpha_bar_t) * noise - sqrt(1 - alpha_bar_t) * x0
 ```
 
-`charbonnier_eps` defaults to `1e-3`. The CQT values are divided by
-`cqt_value_scale=8.0` and then compressed with an invertible `log1p` magnitude
-compression (`cqt_compression=10.0`), so the inverse renderer can undo the
-normalization before waveform reconstruction.
+and the training loss is Charbonnier on the selected prediction target:
+
+```
+loss = mean(sqrt((predicted - target)^2 + charbonnier_eps^2) - charbonnier_eps)
+```
+
+`prediction_type` can be `v_prediction` or `epsilon`, and `charbonnier_eps`
+defaults to `1e-3`. The default training and fast-inference beta schedules are
+rescaled to zero terminal SNR, so the last cumulative alpha is exactly zero.
+Inference uses the posterior-mean update from predicted `x0` instead of the
+older epsilon-form update, which keeps the final `beta=1` step finite for
+v-prediction models.
+
+The current CQT scale test uses `cqt_value_scale=0.25` and
+`cqt_compression=0.0`, so the target is amplified but not log-compressed.
+Changing `prediction_type`, `noise_schedule`, `cqt_value_scale`, or
+`cqt_compression` should use a fresh model directory instead of resuming an old
+checkpoint.
 
 For early runs where the dense WAV-derived conditioning row is a shortcut, pass:
 
@@ -120,14 +134,25 @@ pip install ".[cqt-gpu]"
 Use `--cqt_backend librosa` only for explicit short CPU diagnostics.
 
 Inference samples a complex CQT target and renders it to WAV with the low-memory
-`sum_real` renderer by default. This simply sums channel `0` (the predicted real
-CQT component) over the 89 bins for each time step, then peak-normalizes to WAV
-range. It is not a mathematically exact inverse CQT, but it avoids the huge
-hop-1 `librosa.icqt` workspace.
+`sum_real` renderer by default. This first denormalizes the predicted complex
+CQT, then sums channel `0` (the real component) over the 89 bins for each time
+step and peak-normalizes to WAV range. It is not a mathematically exact inverse
+CQT, but it avoids the huge hop-1 `librosa.icqt` workspace.
 
 ```
 python -m diffwave.inference /path/to/model -s /path/to/file.wav.spec.npy -o output.wav
 ```
+
+To also save a small visualization of the generated real CQT component:
+
+```
+python -m diffwave.inference /path/to/model -s /path/to/file.wav.spec.npy -o output.wav --cqt_real_png
+```
+
+This writes `output_real_cqt.png` by default. You can pass an explicit path as
+`--cqt_real_png preview.png`. The image is a middle crop of the denormalized
+generated CQT real channel, defaults to `0.1` seconds, and maps one CQT value to
+one pixel: negative values are red, positive values are blue, and zero is black.
 
 The exact inverse renderer is still available for short reconstruction tests:
 

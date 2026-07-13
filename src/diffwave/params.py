@@ -15,6 +15,8 @@
 
 import numpy as np
 
+from diffwave.schedule import rescale_zero_terminal_snr
+
 
 class AttrDict(dict):
   def __init__(self, *args, **kwargs):
@@ -32,12 +34,17 @@ class AttrDict(dict):
     return self
 
 
+_training_noise_schedule = rescale_zero_terminal_snr(np.linspace(1e-4, 0.05, 50))
+_fast_inference_noise_schedule = rescale_zero_terminal_snr(np.array([0.0001, 0.001, 0.01, 0.05, 0.2, 0.5]))
+
+
 params = AttrDict(
     # Training params
     batch_size=1,   #eigenverandering (2)   29 causes memory crash
     learning_rate=3e-5, #eigenverandering 2e-4 -> 2e-5
     max_grad_norm=None,
     charbonnier_eps=1e-3,
+    prediction_type='v_prediction',
 
     # Data params
     sample_rate=22050,
@@ -62,8 +69,8 @@ params = AttrDict(
     cqt_scale=True,
     cqt_pad_mode='constant',
     cqt_res_type='soxr_hq',
-    cqt_value_scale=8.0,
-    cqt_compression=10.0,
+    cqt_value_scale=0.25,
+    cqt_compression=0.0,
     cqt_condition_frames=int(22050 * 5) // 256,
 
     # Model params
@@ -71,8 +78,8 @@ params = AttrDict(
     residual_channels=64,
     dilation_cycle_length=13, #eigenverandering 10->13
     unconditional = False,  #eigenverandering
-    noise_schedule=np.linspace(1e-4, 0.05, 50).tolist(),
-    inference_noise_schedule=[0.0001, 0.001, 0.01, 0.05, 0.2, 0.5],
+    noise_schedule=_training_noise_schedule.tolist(),
+    inference_noise_schedule=_fast_inference_noise_schedule.tolist(),
 
     # unconditional sample len
     audio_len = int(22050*5), # unconditional_synthesis_samples #eigenverandering
