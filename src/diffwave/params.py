@@ -40,7 +40,7 @@ _fast_inference_noise_schedule = rescale_zero_terminal_snr(np.array([0.0001, 0.0
 
 params = AttrDict(
     # Training params
-    batch_size=1,   #eigenverandering (2)   29 causes memory crash
+    batch_size=2,   #eigenverandering (2)   29 causes memory crash
     learning_rate=3e-5, #eigenverandering 2e-4 -> 2e-5
     max_grad_norm=None,
     charbonnier_eps=1e-3,
