@@ -3,3 +3,7 @@
 /src/diffwave/__pycache__
 *.pyc
 /src/diffwave/__pycache__
+*.png
+*.wav
+*.json
+*.pyc
